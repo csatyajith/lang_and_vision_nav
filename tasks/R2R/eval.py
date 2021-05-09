@@ -10,23 +10,27 @@ import pprint
 pp = pprint.PrettyPrinter(indent=4)
 
 from env import R2RBatch
-from utils import load_datasets, load_nav_graphs
-from agent import BaseAgent, StopAgent, RandomAgent, ShortestAgent
+from utils import load_datasets, load_nav_graphs, ndtw_graphload, DTW
+from agent import BaseAgent
 
 
 class Evaluation(object):
     ''' Results submission format:  [{'instr_id': string, 'trajectory':[(viewpoint_id, heading_rads, elevation_rads),] } ] '''
 
-    def __init__(self, splits):
+    def __init__(self, splits, scans, tok):
         self.error_margin = 3.0
         self.splits = splits
+        self.tok = tok
         self.gt = {}
         self.instr_ids = []
         self.scans = []
-        for item in load_datasets(splits):
-            self.gt[item['path_id']] = item
-            self.scans.append(item['scan'])
-            self.instr_ids += ['%d_%d' % (item['path_id'],i) for i in range(3)]
+        for split in splits:
+            for item in load_datasets([split]):
+                if scans is not None and item['scan'] not in scans:
+                    continue
+                self.gt[str(item['path_id'])] = item
+                self.scans.append(item['scan'])
+                self.instr_ids += ['%s_%d' % (item['path_id'], i) for i in range(len(item['instructions']))]
         self.scans = set(self.scans)
         self.instr_ids = set(self.instr_ids)
         self.graphs = load_nav_graphs(self.scans)
@@ -46,71 +50,89 @@ class Evaluation(object):
 
     def _score_item(self, instr_id, path):
         ''' Calculate error based on the final position in trajectory, and also
-            the closest position (oracle stopping rule). '''
-        gt = self.gt[int(instr_id.split('_')[0])]
+            the closest position (oracle stopping rule).
+            The path contains [view_id, angle, vofv] '''
+        gt = self.gt[instr_id.split('_')[-2]]
         start = gt['path'][0]
         assert start == path[0][0], 'Result trajectories should include the start position'
         goal = gt['path'][-1]
-        final_position = path[-1][0]
+        final_position = path[-1][0]    # the first of [view_id, angle, vofv]
         nearest_position = self._get_nearest(gt['scan'], goal, path)
         self.scores['nav_errors'].append(self.distances[gt['scan']][final_position][goal])
         self.scores['oracle_errors'].append(self.distances[gt['scan']][nearest_position][goal])
+        self.scores['trajectory_steps'].append(len(path)-1)
         distance = 0 # Work out the length of the path in meters
         prev = path[0]
         for curr in path[1:]:
-            if prev[0] != curr[0]:
-                try:
-                    self.graphs[gt['scan']][prev[0]][curr[0]]
-                except KeyError as err:
-                    print('Error: The provided trajectory moves from %s to %s but the navigation graph contains no '\
-                        'edge between these viewpoints. Please ensure the provided navigation trajectories '\
-                        'are valid, so that trajectory length can be accurately calculated.' % (prev[0], curr[0]))
-                    raise
             distance += self.distances[gt['scan']][prev[0]][curr[0]]
             prev = curr
         self.scores['trajectory_lengths'].append(distance)
-        self.scores['shortest_path_lengths'].append(self.distances[gt['scan']][start][goal])
+        self.scores['shortest_lengths'].append(
+            self.distances[gt['scan']][start][goal]
+        )
 
     def score(self, output_file):
         ''' Evaluate each agent trajectory based on how close it got to the goal location '''
         self.scores = defaultdict(list)
         instr_ids = set(self.instr_ids)
-        with open(output_file) as f:
-            for item in json.load(f):
-                # Check against expected ids
-                if item['instr_id'] in instr_ids:
-                    instr_ids.remove(item['instr_id'])
-                    self._score_item(item['instr_id'], item['trajectory'])
-        assert len(instr_ids) == 0, 'Trajectories not provided for %d instruction ids: %s' % (len(instr_ids),instr_ids)
-        assert len(self.scores['nav_errors']) == len(self.instr_ids)
-        num_successes = len([i for i in self.scores['nav_errors'] if i < self.error_margin])
+        if type(output_file) is str:
+            with open(output_file) as f:
+                results = json.load(f)
+        else:
+            results = output_file
 
-        oracle_successes = len([i for i in self.scores['oracle_errors'] if i < self.error_margin])
+        print('result length', len(results))
+        for item in results:
+            # Check against expected ids
+            if item['instr_id'] in instr_ids:
+                instr_ids.remove(item['instr_id'])
+                self._score_item(item['instr_id'], item['trajectory'])
 
-        spls = []
-        for err,length,sp in zip(self.scores['nav_errors'],self.scores['trajectory_lengths'],self.scores['shortest_path_lengths']):
-            if err < self.error_margin:
-                spls.append(sp/max(length,sp))
-            else:
-                spls.append(0)
-
-        score_summary ={
-            'length': np.average(self.scores['trajectory_lengths']),
+        if 'train' not in self.splits:  # Exclude the training from this. (Because training eval may be partial)
+            assert len(instr_ids) == 0, 'Missing %d of %d instruction ids from %s - not in %s'\
+                           % (len(instr_ids), len(self.instr_ids), ",".join(self.splits), output_file)
+            assert len(self.scores['nav_errors']) == len(self.instr_ids)
+        score_summary = {
             'nav_error': np.average(self.scores['nav_errors']),
-            'oracle success_rate': float(oracle_successes)/float(len(self.scores['oracle_errors'])),
-            'success_rate': float(num_successes)/float(len(self.scores['nav_errors'])),
-            'spl': np.average(spls)
+            'oracle_error': np.average(self.scores['oracle_errors']),
+            'steps': np.average(self.scores['trajectory_steps']),
+            'lengths': np.average(self.scores['trajectory_lengths'])
         }
+        num_successes = len([i for i in self.scores['nav_errors'] if i < self.error_margin])
+        score_summary['success_rate'] = float(num_successes)/float(len(self.scores['nav_errors']))
+        oracle_successes = len([i for i in self.scores['oracle_errors'] if i < self.error_margin])
+        score_summary['oracle_rate'] = float(oracle_successes)/float(len(self.scores['oracle_errors']))
 
-        assert score_summary['spl'] <= score_summary['success_rate']
+        spl = [float(error < self.error_margin) * l / max(l, p, 0.01)
+            for error, p, l in
+            zip(self.scores['nav_errors'], self.scores['trajectory_lengths'], self.scores['shortest_lengths'])
+        ]
+        score_summary['spl'] = np.average(spl)
         return score_summary, self.scores
+
+    def bleu_score(self, path2inst):
+        from bleu import compute_bleu
+        refs = []
+        candidates = []
+        for path_id, inst in path2inst.items():
+            path_id = str(path_id)
+            assert path_id in self.gt
+            # There are three references
+            refs.append([self.tok.split_sentence(sent) for sent in self.gt[path_id]['instructions']])
+            candidates.append([self.tok.index_to_word[word_id] for word_id in inst])
+
+        tuple = compute_bleu(refs, candidates, smooth=False)
+        bleu_score = tuple[0]
+        precisions = tuple[1]
+
+        return bleu_score, precisions
 
 
 RESULT_DIR = 'tasks/R2R/results/'
 
 def eval_simple_agents():
     ''' Run simple baselines on each split. '''
-    for split in ['train', 'val_seen', 'val_unseen']:
+    for split in ['train', 'val_seen', 'val_unseen', 'test']:
         env = R2RBatch(None, batch_size=1, splits=[split])
         ev = Evaluation([split])
 
@@ -139,11 +161,4 @@ def eval_seq2seq():
 
 
 if __name__ == '__main__':
-
     eval_simple_agents()
-    #eval_seq2seq()
-
-
-
-
-
