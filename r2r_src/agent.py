@@ -102,9 +102,9 @@ class Seq2SeqAgent(BaseAgent):
 
         enc_hidden_size = args.rnn_dim // 2 if args.bidir else args.rnn_dim
 
-        self.encoder = model.LangVisionEncoder(tok.vocab_size(), args.wemb, enc_hidden_size, padding_idx,
+        self.encoder = model.Lang_Vision_Encoder(tok.vocab_size(), args.wemb, enc_hidden_size, padding_idx,
                                                args.dropout, bidirectional=args.bidir).cuda()
-        self.decoder = model.LangVisionDecoder(args.aemb, args.rnn_dim, args.dropout,
+        self.decoder = model.Lang_Vision_Decoder(args.aemb, args.rnn_dim, args.dropout,
                                                feature_size=self.feature_size + args.angle_feat_size).cuda()
         self.critic = model.Critic().cuda()
         self.models = (self.encoder, self.decoder, self.critic)
